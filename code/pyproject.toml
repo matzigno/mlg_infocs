@@ -8,6 +8,7 @@ dependencies = [
     "jupyter>=1.1.1",
     "networkx>=3.6.1",
     "numpy>=2.4.4",
+    "orbit-count>=0.1.0",
     "pandas>=3.0.2",
     "scikit-learn>=1.8.0",
     "torch>=2.11.0",
@@ -16,3 +17,15 @@ dependencies = [
     "torch-scatter>=2.1.2",
     "torch-sparse>=0.6.18",
 ]
+
+[tool.uv.sources]
+torch-cluster = { index = "pyg-torch-211-cpu" }
+torch-scatter = { index = "pyg-torch-211-cpu" }
+torch-sparse = { index = "pyg-torch-211-cpu" }
+pyg-lib = { index = "pyg-torch-211-cpu" }
+
+[[tool.uv.index]]
+name = "pyg-torch-211-cpu"
+url = "https://data.pyg.org/whl/torch-2.11.0+cpu.html"
+format = "flat"
+explicit = true

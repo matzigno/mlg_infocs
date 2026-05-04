@@ -9,6 +9,7 @@ from torch_geometric.utils import to_networkx
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import TruncatedSVD
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import (
@@ -24,6 +25,7 @@ from sklearn.metrics import accuracy_score, f1_score, classification_report
 # 1. Load Cora from PyTorch Geometric
 # ------------------------------------------------------------
 
+
 def load_cora(root: str = "./data/planetoid"):
     dataset = Planetoid(root=root, name="Cora")
     data = dataset[0]
@@ -33,6 +35,7 @@ def load_cora(root: str = "./data/planetoid"):
 # ------------------------------------------------------------
 # 2. Convert PyG Data object into a NetworkX graph
 # ------------------------------------------------------------
+
 
 def pyg_cora_to_networkx(data, to_undirected: bool = True):
     """
@@ -57,6 +60,7 @@ def pyg_cora_to_networkx(data, to_undirected: bool = True):
 # ------------------------------------------------------------
 # 3. Define train/test masks
 # ------------------------------------------------------------
+
 
 def define_train_test_masks(
     data,
@@ -113,6 +117,7 @@ def define_train_test_masks(
 # ------------------------------------------------------------
 # 4. Sklearn transformer for NetworkX feature engineering
 # ------------------------------------------------------------
+
 
 class NetworkXNodeFeatureTransformer(BaseEstimator, TransformerMixin):
     """
@@ -176,7 +181,9 @@ class NetworkXNodeFeatureTransformer(BaseEstimator, TransformerMixin):
         # Degree centralities
         if G.is_directed():
             safe_add_feature("in_degree_centrality", lambda: nx.in_degree_centrality(G))
-            safe_add_feature("out_degree_centrality", lambda: nx.out_degree_centrality(G))
+            safe_add_feature(
+                "out_degree_centrality", lambda: nx.out_degree_centrality(G)
+            )
             safe_add_feature("total_degree_centrality", lambda: nx.degree_centrality(G))
         else:
             safe_add_feature("degree_centrality", lambda: nx.degree_centrality(G))
@@ -184,7 +191,9 @@ class NetworkXNodeFeatureTransformer(BaseEstimator, TransformerMixin):
         # Closeness centrality
         if G.is_directed():
             safe_add_feature("closeness_in", lambda: nx.closeness_centrality(G))
-            safe_add_feature("closeness_out", lambda: nx.closeness_centrality(G.reverse(copy=True)))
+            safe_add_feature(
+                "closeness_out", lambda: nx.closeness_centrality(G.reverse(copy=True))
+            )
         else:
             safe_add_feature("closeness", lambda: nx.closeness_centrality(G))
 
@@ -224,6 +233,7 @@ class NetworkXNodeFeatureTransformer(BaseEstimator, TransformerMixin):
 
         # HITS is meaningful for directed graphs.
         if G.is_directed():
+
             def compute_hubs():
                 hubs, _ = nx.hits(
                     G,
@@ -246,13 +256,15 @@ class NetworkXNodeFeatureTransformer(BaseEstimator, TransformerMixin):
             safe_add_feature("hits_authority", compute_authorities)
 
         # Clustering coefficient
-        safe_add_feature("clustering", lambda: nx.clustering(G))
+        safe_add_feature("clustering", lambda: nx.clustering(G.to_undirected()))
 
         return self
 
     def transform(self, X):
         if not hasattr(self, "feature_maps_"):
-            raise RuntimeError("The transformer must be fitted before calling transform().")
+            raise RuntimeError(
+                "The transformer must be fitted before calling transform()."
+            )
 
         node_ids = np.asarray(X).reshape(-1).astype(int)
 
@@ -269,8 +281,118 @@ class NetworkXNodeFeatureTransformer(BaseEstimator, TransformerMixin):
 
 
 # ------------------------------------------------------------
-# 5. Train and evaluate models
+# 5. Full GDV computation with orbit-count / ORCA
 # ------------------------------------------------------------
+
+
+def make_orca_compatible_graph(G, num_nodes: int):
+    """
+    ORCA-style orbit counting assumes a simple undirected graph.
+
+    This function:
+    - converts the graph to undirected;
+    - removes self-loops;
+    - removes parallel edges if present;
+    - makes sure all nodes 0, ..., num_nodes - 1 are present.
+    """
+    H = nx.Graph(G)
+    H.remove_edges_from(nx.selfloop_edges(H))
+    H.add_nodes_from(range(num_nodes))
+    return H
+
+
+def compute_full_gdv_features(
+    G,
+    num_nodes: int,
+    graphlet_size: int = 5,
+    log_transform: bool = True,
+):
+    """
+    Computes node Graphlet Degree Vectors using orbit-count.
+
+    graphlet_size=4 returns orbit counts up to 4-node graphlets.
+    graphlet_size=5 returns the standard full node GDV up to 5-node graphlets.
+
+    Returns
+    -------
+    X_gdv : np.ndarray
+        Matrix of shape (num_nodes, num_orbits).
+
+    gdv_feature_names : list[str]
+        Feature names gdv_o0, gdv_o1, ...
+    """
+    try:
+        import orbit_count
+    except ImportError as exc:
+        raise ImportError(
+            "The package 'orbit-count' is required. Install it with:\n\n"
+            "    uv add orbit-count\n\n"
+            "or:\n\n"
+            "    pip install orbit-count\n"
+        ) from exc
+
+    if graphlet_size not in {4, 5}:
+        raise ValueError("orbit-count supports graphlet_size=4 or graphlet_size=5.")
+
+    H = make_orca_compatible_graph(G, num_nodes=num_nodes)
+
+    node_list = list(range(num_nodes))
+
+    X_gdv = orbit_count.node_orbit_counts(
+        H,
+        graphlet_size=graphlet_size,
+        node_list=node_list,
+    ).astype(float)
+
+    if log_transform:
+        X_gdv = np.log1p(X_gdv)
+
+    gdv_feature_names = [f"gdv_o{i}" for i in range(X_gdv.shape[1])]
+
+    return X_gdv, gdv_feature_names
+
+
+# ------------------------------------------------------------
+# 6. Dimensionality reduction of Cora node attributes
+# ------------------------------------------------------------
+
+
+def compute_reduced_cora_node_features(
+    data,
+    train_mask_np,
+    n_components: int = 7,
+    random_state: int = 42,
+):
+    """
+    Reduces original Cora node attributes to n_components.
+
+    Cora node attributes are high-dimensional sparse bag-of-words-like
+    vectors. TruncatedSVD is appropriate because it does not require
+    centering the feature matrix.
+
+    To avoid supervised evaluation leakage, the reducer is fitted only
+    on training nodes and then applied to all nodes.
+    """
+    X_raw = data.x.cpu().numpy().astype(float)
+
+    reducer = TruncatedSVD(
+        n_components=n_components,
+        random_state=random_state,
+    )
+
+    reducer.fit(X_raw[train_mask_np])
+
+    X_reduced = reducer.transform(X_raw)
+
+    feature_names = [f"cora_svd_{i}" for i in range(n_components)]
+
+    return X_reduced, feature_names, reducer
+
+
+# ------------------------------------------------------------
+# 7. Train and evaluate models
+# ------------------------------------------------------------
+
 
 def evaluate_model(name, model, X_test, y_test):
     y_pred = model.predict(X_test)
@@ -286,11 +408,25 @@ def evaluate_model(name, model, X_test, y_test):
 
 def main():
     RANDOM_STATE = 70
-    # Set to False if you want to preserve the directed citation graph.
+
+    # For ORCA / GDV computation, the graph must be simple and undirected.
     TO_UNDIRECTED = True
+
     # Choose 'planetoid' for the canonical PyG split, or 'stratified'
     # for a newly generated train/test split.
     MASK_MODE = "stratified"
+
+    # Feature switches
+    USE_NETWORKX_STRUCTURAL_FEATURES = True
+    USE_GDV_FEATURES = False
+    USE_REDUCED_CORA_NODE_FEATURES = True
+
+    # Full GDV: graphlets up to 5 nodes.
+    GDV_GRAPHLET_SIZE = 5
+
+    # Cora node attribute reduction.
+    CORA_NODE_FEATURE_COMPONENTS = 40
+
     dataset, data = load_cora()
     G = pyg_cora_to_networkx(data, to_undirected=TO_UNDIRECTED)
 
@@ -308,21 +444,87 @@ def main():
     train_mask_np = train_mask.cpu().numpy()
     test_mask_np = test_mask.cpu().numpy()
 
-    # Feature engineering from the NetworkX graph.
-    nx_feature_extractor = NetworkXNodeFeatureTransformer(
-        graph=G,
-        approximate_betweenness=True,
-        betweenness_k=256,
-        random_state=RANDOM_STATE,
-    )
+    feature_blocks = []
+    feature_names = []
 
-    X_structural = nx_feature_extractor.fit_transform(node_ids)
+    # --------------------------------------------------------
+    # NetworkX structural features
+    # --------------------------------------------------------
 
-    print("Extracted structural features:")
-    print(nx_feature_extractor.get_feature_names_out())
+    if USE_NETWORKX_STRUCTURAL_FEATURES:
+        nx_feature_extractor = NetworkXNodeFeatureTransformer(
+            graph=G,
+            approximate_betweenness=True,
+            betweenness_k=256,
+            random_state=RANDOM_STATE,
+        )
 
-    X_train = X_structural[train_mask_np]
-    X_test = X_structural[test_mask_np]
+        X_structural = nx_feature_extractor.fit_transform(node_ids)
+
+        structural_feature_names = list(nx_feature_extractor.get_feature_names_out())
+
+        feature_blocks.append(X_structural)
+        feature_names.extend(structural_feature_names)
+
+        print("\nNetworkX structural features:")
+        print(structural_feature_names)
+
+    # --------------------------------------------------------
+    # Full Graphlet Degree Vector features
+    # --------------------------------------------------------
+
+    if USE_GDV_FEATURES:
+        X_gdv, gdv_feature_names = compute_full_gdv_features(
+            G,
+            num_nodes=data.num_nodes,
+            graphlet_size=GDV_GRAPHLET_SIZE,
+            log_transform=True,
+        )
+
+        feature_blocks.append(X_gdv)
+        feature_names.extend(gdv_feature_names)
+
+        print("\nGDV features:")
+        print(f"Number of GDV features: {X_gdv.shape[1]}")
+        print(gdv_feature_names)
+
+    # --------------------------------------------------------
+    # Reduced original Cora node attributes
+    # --------------------------------------------------------
+
+    if USE_REDUCED_CORA_NODE_FEATURES:
+        X_cora_reduced, cora_feature_names, reducer = (
+            compute_reduced_cora_node_features(
+                data,
+                train_mask_np=train_mask_np,
+                n_components=CORA_NODE_FEATURE_COMPONENTS,
+                random_state=RANDOM_STATE,
+            )
+        )
+
+        feature_blocks.append(X_cora_reduced)
+        feature_names.extend(cora_feature_names)
+
+        print("\nReduced Cora node-attribute features:")
+        print(cora_feature_names)
+        print(
+            "Explained variance ratio sum:",
+            reducer.explained_variance_ratio_.sum(),
+        )
+
+    # --------------------------------------------------------
+    # Final feature matrix
+    # --------------------------------------------------------
+
+    X_all = np.hstack(feature_blocks)
+
+    print("\nFinal feature matrix")
+    print("--------------------")
+    print("Shape:", X_all.shape)
+    print("Number of features:", len(feature_names))
+
+    X_train = X_all[train_mask_np]
+    X_test = X_all[test_mask_np]
     y_train = y[train_mask_np]
     y_test = y[test_mask_np]
 
